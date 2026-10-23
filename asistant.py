@@ -1,283 +1,362 @@
 import os
-import threading
+import sys
 import json
-import customtkinter as ctk
+import threading
+import html
+from html.parser import HTMLParser
+from pathlib import Path
+import tkinter as tk
 from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+import requests
+from openai import OpenAI
 import PyPDF2
 import docx
-from openai import OpenAI
 
-# Настройка темы
-ctk.set_appearance_mode("Dark")
+APP_NAME = "Помощник AI"
+CONFIG_FILE = Path.home() / ".pomoshchnik_ai_config.json"
+MAX_CONTEXT_CHARS = 60000
+ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
-CONFIG_FILE = "aichat_config.json"
 
-class AichatStyleAssistant(ctk.CTk):
+class SearchParser(HTMLParser):
+    """Extract readable text and links from DuckDuckGo HTML results."""
     def __init__(self):
         super().__init__()
+        self.results = []
+        self._in_result = False
+        self._in_snippet = False
+        self._current = {"title": "", "url": "", "snippet": ""}
+        self._capture = None
 
-        self.title("Aichatting — Document Assistant")
-        self.geometry("1050x700")
-        self.minsize(900, 600)
-        
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = attrs.get("class", "")
+        if tag == "a" and "result__a" in classes:
+            self._current = {"title": "", "url": attrs.get("href", ""), "snippet": ""}
+            self._capture = "title"
+        elif tag in ("a", "div") and ("result__snippet" in classes):
+            self._capture = "snippet"
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._capture == "title":
+            if self._current.get("title"):
+                self.results.append(self._current.copy())
+            self._capture = None
+        elif tag in ("a", "div") and self._capture == "snippet":
+            self._capture = None
+
+    def handle_data(self, data):
+        if self._capture in ("title", "snippet"):
+            self._current[self._capture] += data.strip() + " "
+
+
+class PomoshchnikAI(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_NAME)
+        self.geometry("1120x760")
+        self.minsize(900, 620)
         self.document_text = ""
+        self.document_names = []
         self.load_config()
 
-        # Главный контейнер (сетка из двух колонок: слева меню, справа чат)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
+        self.sidebar = ctk.CTkFrame(self, width=285, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_columnconfigure(0, weight=1)
+        self.sidebar.grid_rowconfigure(7, weight=1)
 
-        # ==================== ЛЕВАЯ ПАНЕЛЬ (Sidebar) ====================
-        self.sidebar_frame = ctk.CTkFrame(self, width=280, corner_radius=0, fg_color=("#1e293b", "#0f172a"))
-        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(5, weight=1)
-
-        # Логотип / Название
-        self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="💬 Aichatting", font=("Segoe UI Bold", 20), text_color="#38bdf8")
-        self.logo_label.grid(row=0, column=0, padx=20, pady=(25, 15), sticky="w")
-
-        # Выбор провайдера ИИ
-        self.prov_title = ctk.CTkLabel(self.sidebar_frame, text="Модель ИИ:", font=("Segoe UI", 12, "bold"), text_color="#94a3b8")
-        self.prov_title.grid(row=1, column=0, padx=20, sticky="w")
+        ctk.CTkLabel(self.sidebar, text="✦ Помощник AI",
+                     font=("Segoe UI", 22, "bold")).grid(
+            row=0, column=0, padx=18, pady=(24, 20), sticky="w")
+        ctk.CTkLabel(self.sidebar, text="Провайдер ИИ",
+                     font=("Segoe UI", 12, "bold")).grid(
+            row=1, column=0, padx=18, sticky="w")
 
         self.providers = {
-            "Google Gemini (Flash)": {
+            "Google Gemini (бесплатный тариф)": {
                 "url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-                "model": "gemini-2.0-flash"
+                "model": "gemini-2.0-flash",
             },
-            "Groq (Llama 3.3)": {
+            "Groq (бесплатный тариф)": {
                 "url": "https://api.groq.com/openai/v1",
-                "model": "llama-3.3-70b-versatile"
-            }
+                "model": "llama-3.3-70b-versatile",
+            },
+            "OpenRouter (доступные бесплатные модели)": {
+                "url": "https://openrouter.ai/api/v1",
+                "model": "meta-llama/llama-3.3-70b-instruct:free",
+            },
         }
         self.provider_menu = ctk.CTkOptionMenu(
-            self.sidebar_frame, 
-            values=list(self.providers.keys()), 
-            command=self.on_provider_change,
-            fg_color="#334155", button_color="#475569", button_hover_color="#64748b"
-        )
-        self.provider_menu.grid(row=2, column=0, padx=20, pady=(5, 15), sticky="ew")
+            self.sidebar, values=list(self.providers), command=self.provider_changed)
+        self.provider_menu.grid(row=2, column=0, padx=18, pady=(6, 14), sticky="ew")
         if self.saved_provider in self.providers:
             self.provider_menu.set(self.saved_provider)
 
-        # Поле API Ключа
-        self.api_title = ctk.CTkLabel(self.sidebar_frame, text="API Key:", font=("Segoe UI", 12, "bold"), text_color="#94a3b8")
-        self.api_title.grid(row=3, column=0, padx=20, sticky="w")
-
-        self.api_entry = ctk.CTkEntry(self.sidebar_frame, show="*", placeholder_text="Вставьте ключ...", fg_color="#334155", border_color="#475569")
-        self.api_entry.grid(row=4, column=0, padx=20, pady=(5, 15), sticky="ew")
+        ctk.CTkLabel(self.sidebar, text="API-ключ выбранного сервиса",
+                     font=("Segoe UI", 12, "bold")).grid(
+            row=3, column=0, padx=18, sticky="w")
+        self.api_entry = ctk.CTkEntry(self.sidebar, show="*", placeholder_text="Вставьте API-ключ")
+        self.api_entry.grid(row=4, column=0, padx=18, pady=(6, 10), sticky="ew")
         if self.saved_api_key:
             self.api_entry.insert(0, self.saved_api_key)
 
-        # Блок управления документом (карточка как на скрипте Recent Chat)
-        self.doc_card = ctk.CTkFrame(self.sidebar_frame, fg_color=("#334155", "#1e293b"), corner_radius=12)
-        self.doc_card.grid(row=5, column=0, padx=15, pady=10, sticky="new")
-        self.doc_card.grid_columnconfigure(0, weight=1)
+        self.save_btn = ctk.CTkButton(self.sidebar, text="Сохранить настройки",
+                                      command=self.save_config, fg_color="#475569")
+        self.save_btn.grid(row=5, column=0, padx=18, pady=(0, 16), sticky="ew")
 
-        self.doc_header = ctk.CTkLabel(self.doc_card, text="📁 Документ для анализа", font=("Segoe UI", 13, "bold"), text_color="#f1f5f9")
-        self.doc_header.grid(row=0, column=0, padx=15, pady=(12, 5), sticky="w")
+        ctk.CTkLabel(self.sidebar, text="Документы",
+                     font=("Segoe UI", 13, "bold")).grid(
+            row=6, column=0, padx=18, sticky="w")
+        self.doc_status = ctk.CTkLabel(
+            self.sidebar, text="Файлы не выбраны", justify="left",
+            wraplength=240, anchor="w")
+        self.doc_status.grid(row=7, column=0, padx=18, pady=8, sticky="new")
 
-        self.doc_status_label = ctk.CTkLabel(self.doc_card, text="Файл не выбран", font=("Segoe UI", 11), text_color="#94a3b8", wraplength=220, justify="left")
-        self.doc_status_label.grid(row=1, column=0, padx=15, pady=(0, 10), sticky="w")
+        self.load_docs_btn = ctk.CTkButton(
+            self.sidebar, text="Добавить документы…", command=self.load_documents)
+        self.load_docs_btn.grid(row=8, column=0, padx=18, pady=5, sticky="ew")
+        self.save_txt_btn = ctk.CTkButton(
+            self.sidebar, text="Объединить и сохранить TXT…",
+            command=self.export_txt, fg_color="#0f766e")
+        self.save_txt_btn.grid(row=9, column=0, padx=18, pady=5, sticky="ew")
+        self.save_docx_btn = ctk.CTkButton(
+            self.sidebar, text="Объединить и сохранить DOCX…",
+            command=self.export_docx, fg_color="#0f766e")
+        self.save_docx_btn.grid(row=10, column=0, padx=18, pady=(5, 18), sticky="ew")
 
-        self.upload_btn = ctk.CTkButton(self.doc_card, text="Загрузить файл", command=self.load_document, fg_color="#0ea5e9", hover_color="#0284c7", height=32)
-        self.upload_btn.grid(row=2, column=0, padx=15, pady=(0, 15), sticky="ew")
+        self.main = ctk.CTkFrame(self, corner_radius=0)
+        self.main.grid(row=0, column=1, sticky="nsew")
+        self.main.grid_columnconfigure(0, weight=1)
+        self.main.grid_rowconfigure(1, weight=1)
+        self.top = ctk.CTkFrame(self.main, height=56, corner_radius=0)
+        self.top.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(self.top, text="Написание текстов · Поиск · Анализ документов",
+                     font=("Segoe UI", 15, "bold")).pack(side="left", padx=20, pady=15)
+        self.chat = ctk.CTkTextbox(self.main, wrap="word", font=("Segoe UI", 13))
+        self.chat.grid(row=1, column=0, padx=18, pady=12, sticky="nsew")
+        self.chat.configure(state="disabled")
 
-        # Кнопка сохранения настроек внизу сайдбара
-        self.save_btn = ctk.CTkButton(self.sidebar_frame, text="Сохранить настройки", command=self.save_config, fg_color="transparent", border_color="#475569", border_width=1, hover_color="#334155", text_color="#cbd5e1")
-        self.save_btn.grid(row=6, column=0, padx=20, pady=20, sticky="ew")
+        self.actions = ctk.CTkFrame(self.main, fg_color="transparent")
+        self.actions.grid(row=2, column=0, padx=18, pady=(0, 6), sticky="ew")
+        self.actions.grid_columnconfigure(0, weight=1)
+        self.mode = ctk.CTkOptionMenu(
+            self.actions, values=[
+                "Обычный ответ", "Написать текст", "Проанализировать документы",
+                "Поиск в интернете и ответ"
+            ], width=245)
+        self.mode.set("Обычный ответ")
+        self.mode.grid(row=0, column=0, sticky="w", pady=(0, 6))
 
-
-        # ==================== ПРАВАЯ ПАНЕЛЬ (Чат область) ====================
-        self.chat_main_frame = ctk.CTkFrame(self, fg_color=("#f8fafc", "#0b0f19"), corner_radius=0)
-        self.chat_main_frame.grid(row=0, column=1, sticky="nsew")
-        self.chat_main_frame.grid_columnconfigure(0, weight=1)
-        self.chat_main_frame.grid_rowconfigure(1, weight=1)
-
-        # Верхняя панель чата (Заголовок как на Aichatting)
-        self.chat_top_bar = ctk.CTkFrame(self.chat_main_frame, height=60, fg_color=("#ffffff", "#111827"), corner_radius=0)
-        self.chat_top_bar.grid(row=0, column=0, sticky="ew")
-        
-        self.chat_title = ctk.CTkLabel(self.chat_top_bar, text="🤖 ChatBot (Документ активен)", font=("Segoe UI Bold", 15), text_color=("#0f172a", "#f8fafc"))
-        self.chat_title.pack(side="left", padx=25, pady=15)
-
-        # Область сообщений (Чат-бокс)
-        self.chat_box = ctk.CTkTextbox(self.chat_main_frame, state="disabled", wrap="word", font=("Segoe UI", 13), fg_color=("#f8fafc", "#0b0f19"), text_color=("#1e293b", "#f1f5f9"))
-        self.chat_box.grid(row=1, column=0, padx=20, pady=15, sticky="nsew")
-
-        # Нижняя панель ввода (Плавающее поле ввода как на референсе с кнопкой отправки)
-        self.input_container = ctk.CTkFrame(self.chat_main_frame, fg_color="transparent", height=80)
-        self.input_container.grid(row=2, column=0, padx=25, pady=(0, 20), sticky="ew")
-        self.input_container.grid_columnconfigure(0, weight=1)
-
-        self.user_input = ctk.CTkEntry(
-            self.input_container, 
-            placeholder_text="Enter your message...", 
-            height=50, 
-            corner_radius=25,
-            font=("Segoe UI", 13),
-            fg_color=("#ffffff", "#1e293b"),
-            border_color=("#cbd5e1", "#334155"),
-            border_width=1
-        )
-        self.user_input.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        self.user_input.bind("<Return>", lambda event: self.send_message())
-
-        self.send_btn = ctk.CTkButton(
-            self.input_container, 
-            text="➤", 
-            width=50, 
-            height=50, 
-            corner_radius=25,
-            font=("Segoe UI Bold", 16),
-            fg_color="#f97316", # Оранжевый акцент кнопки отправки как на референсе
-            hover_color="#ea580c",
-            command=self.send_message
-        )
-        self.send_btn.grid(row=0, column=1)
-
-        # Приветственное сообщение
-        self.append_to_chat("Система", "Добро пожаловать в Aichatting Assistant! Загрузите документ слева, введите API-ключ и задавайте вопросы.")
-
-    def on_provider_change(self, choice):
-        pass
+        self.input = ctk.CTkTextbox(self.main, height=95, wrap="word", font=("Segoe UI", 13))
+        self.input.grid(row=3, column=0, padx=18, pady=(0, 10), sticky="ew")
+        self.input.bind("<Control-Return>", lambda event: self.send_message())
+        self.bottom = ctk.CTkFrame(self.main, fg_color="transparent")
+        self.bottom.grid(row=4, column=0, padx=18, pady=(0, 16), sticky="ew")
+        self.status = ctk.CTkLabel(self.bottom, text="Готов к работе", anchor="w")
+        self.status.pack(side="left", fill="x", expand=True)
+        self.send_btn = ctk.CTkButton(self.bottom, text="Отправить  ➤",
+                                      command=self.send_message, width=150)
+        self.send_btn.pack(side="right")
+        self.append("Система", "Добро пожаловать! Выберите режим, введите запрос. Можно загрузить несколько PDF, DOCX и TXT, проанализировать их и объединить в один файл.\n\nДля ИИ нужен API-ключ выбранного провайдера. Бесплатные тарифы имеют лимиты и могут меняться. Не отправляйте в сторонние сервисы конфиденциальные документы без разрешения организации.")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_config(self):
         self.saved_api_key = ""
-        self.saved_provider = "Google Gemini (Flash)"
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    self.saved_api_key = data.get("api_key", "")
-                    self.saved_provider = data.get("provider", "Google Gemini (Flash)")
-            except:
-                pass
-
-    def save_config(self):
-        data = {
-            "api_key": self.api_entry.get().strip(),
-            "provider": self.provider_menu.get()
-        }
+        self.saved_provider = "Google Gemini (бесплатный тариф)"
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            messagebox.showinfo("Успех", "Настройки сохранены локально.")
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось сохранить: {e}")
+            if CONFIG_FILE.exists():
+                data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                self.saved_api_key = data.get("api_key", "")
+                self.saved_provider = data.get("provider", self.saved_provider)
+        except Exception:
+            pass
 
-    def load_document(self):
-        filepath = filedialog.askopenfilename(
-            filetypes=[("Documents", "*.pdf *.docx *.txt"), ("All Files", "*.*")]
-        )
-        if not filepath:
+    def save_config(self, silent=False):
+        data = {"api_key": self.api_entry.get().strip(), "provider": self.provider_menu.get()}
+        try:
+            CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            if not silent:
+                messagebox.showinfo("Помощник AI", f"Настройки сохранены в профиле пользователя:\n{CONFIG_FILE}")
+        except Exception as exc:
+            if not silent:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить настройки: {exc}")
+
+    def on_close(self):
+        self.save_config(silent=True)
+        self.destroy()
+
+    def provider_changed(self, _choice):
+        pass
+
+    def append(self, who, text):
+        self.chat.configure(state="normal")
+        self.chat.insert("end", f"\n{'─' * 44}\n{who}\n{'─' * 44}\n{text}\n")
+        self.chat.configure(state="disabled")
+        self.chat.see("end")
+
+    def set_status(self, text):
+        self.after(0, lambda: self.status.configure(text=text))
+
+    def read_file(self, path):
+        ext = path.suffix.lower()
+        if ext == ".pdf":
+            parts = []
+            with path.open("rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages:
+                    parts.append(page.extract_text() or "")
+            return "\n".join(parts)
+        if ext == ".docx":
+            d = docx.Document(str(path))
+            parts = [p.text for p in d.paragraphs]
+            for table in d.tables:
+                for row in table.rows:
+                    parts.append(" | ".join(cell.text for cell in row.cells))
+            return "\n".join(parts)
+        if ext == ".txt":
+            return path.read_text(encoding="utf-8-sig")
+        raise ValueError(f"Формат {ext} не поддерживается")
+
+    def load_documents(self):
+        names = filedialog.askopenfilenames(
+            title="Выберите один или несколько документов",
+            filetypes=[("Документы PDF, Word, TXT", "*.pdf *.docx *.txt"),
+                       ("Все файлы", "*.*")])
+        if not names:
             return
+        pieces, loaded, errors = [], [], []
+        for name in names:
+            path = Path(name)
+            try:
+                text = self.read_file(path).strip()
+                if not text:
+                    errors.append(f"{path.name}: текст не извлечён (возможно, PDF состоит из сканов)")
+                    continue
+                pieces.append(f"\n\n===== ДОКУМЕНТ: {path.name} =====\n{text}")
+                loaded.append(path.name)
+            except Exception as exc:
+                errors.append(f"{path.name}: {exc}")
+        if pieces:
+            self.document_text = "\n".join(pieces)
+            self.document_names = loaded
+            shown = "\n".join("• " + n for n in loaded)
+            if len(shown) > 850:
+                shown = shown[:850] + "…"
+            self.doc_status.configure(text=f"Загружено: {len(loaded)}\n{shown}")
+            self.append("Система", f"Загружено документов: {len(loaded)}. Их текст доступен для анализа и объединения.")
+        if errors:
+            messagebox.showwarning("Некоторые файлы пропущены", "\n".join(errors[:10]))
 
-        filename = os.path.basename(filepath)
-        self.doc_status_label.configure(text=f"Загрузка: {filename}...", text_color="#fbbf24")
-        self.update()
+    def export_txt(self):
+        if not self.document_text:
+            messagebox.showwarning("Нет документов", "Сначала загрузите документы.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".txt",
+                    filetypes=[("Текстовый файл", "*.txt")], initialfile="объединённые_документы.txt")
+        if path:
+            Path(path).write_text(self.document_text, encoding="utf-8")
+            messagebox.showinfo("Готово", f"Файл сохранён:\n{path}")
 
-        try:
-            ext = os.path.splitext(filepath)[1].lower()
-            text = ""
-            if ext == ".pdf":
-                with open(filepath, "rb") as f:
-                    reader = PyPDF2.PdfReader(f)
-                    for page in reader.pages:
-                        extracted = page.extract_text()
-                        if extracted:
-                            text += extracted + "\n"
-            elif ext == ".docx":
-                doc = docx.Document(filepath)
-                for para in doc.paragraphs:
-                    text += para.text + "\n"
-            elif ext == ".txt":
-                with open(filepath, "r", encoding="utf-8") as f:
-                    text = f.read()
-            else:
-                messagebox.showerror("Ошибка", "Формат не поддерживается.")
-                self.doc_status_label.configure(text="Файл не выбран", text_color="#94a3b8")
-                return
+    def export_docx(self):
+        if not self.document_text:
+            messagebox.showwarning("Нет документов", "Сначала загрузите документы.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".docx",
+                    filetypes=[("Документ Word", "*.docx")], initialfile="объединённые_документы.docx")
+        if path:
+            out = docx.Document()
+            out.add_heading("Объединённые документы", 0)
+            for chunk in self.document_text.split("\n\n===== ДОКУМЕНТ: "):
+                if not chunk.strip():
+                    continue
+                lines = chunk.splitlines()
+                title = lines[0].replace("=====", "").strip() if lines else "Документ"
+                out.add_heading(title, level=1)
+                body = "\n".join(lines[1:]) if len(lines) > 1 else chunk
+                for para in body.splitlines():
+                    if para.strip():
+                        out.add_paragraph(para)
+            out.save(path)
+            messagebox.showinfo("Готово", f"Файл сохранён:\n{path}")
 
-            self.document_text = text.strip()
-            self.doc_status_label.configure(text=f"✓ {filename}", text_color="#4ade80")
-            self.chat_title.configure(text=f"🤖 ChatBot ({filename})")
-            self.append_to_chat("Система", f"Документ '{filename}' успешно загружен и готов к анализу.")
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Ошибка чтения файла:\n{e}")
-            self.doc_status_label.configure(text="Ошибка загрузки", text_color="#f87171")
-
-    def append_to_chat(self, sender, message):
-        self.chat_box.configure(state="normal")
-        self.chat_box.insert("end", f"[{sender}]\n{message}\n\n")
-        self.chat_box.configure(state="disabled")
-        self.chat_box.yview("end")
+    def web_search(self, query):
+        # Ordinary HTTPS search request; no spoofed browser headers or traffic concealment.
+        response = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query}, timeout=20,
+            headers={"User-Agent": "PomoshchnikAI/1.0 (web search)"})
+        response.raise_for_status()
+        parser = SearchParser()
+        parser.feed(response.text)
+        return parser.results[:7]
 
     def send_message(self):
-        question = self.user_input.get().strip()
-        api_key = self.api_entry.get().strip()
-        
-        selected_provider = self.provider_menu.get()
-        prov_data = self.providers[selected_provider]
-
-        if not api_key:
-            messagebox.showwarning("Внимание", "Введите API Key!")
-            return
+        question = self.input.get("1.0", "end").strip()
         if not question:
             return
+        api_key = self.api_entry.get().strip()
+        if not api_key:
+            messagebox.showwarning("Нужен API-ключ", "Введите API-ключ выбранного провайдера. Ключ выдаётся на сайте провайдера; бесплатный доступ зависит от его актуальных условий.")
+            return
+        self.input.delete("1.0", "end")
+        self.append("Вы", question)
+        self.send_btn.configure(state="disabled", text="Обработка…")
+        self.set_status("Выполняется запрос…")
+        provider = self.provider_menu.get()
+        settings = self.providers[provider]
+        mode = self.mode.get()
+        threading.Thread(target=self.worker, args=(question, api_key, provider, settings, mode), daemon=True).start()
 
-        self.user_input.delete(0, "end")
-        self.append_to_chat("Вы", question)
-
-        self.send_btn.configure(state="disabled", text="...")
-        threading.Thread(target=self.ask_ai_masked, args=(prov_data["url"], prov_data["model"], api_key, question, selected_provider), daemon=True).start()
-
-    def ask_ai_masked(self, base_url, model_name, api_key, question, provider_name):
+    def worker(self, question, api_key, provider, settings, mode):
         try:
-            # 🛡️ Маскировка под стандартный браузер Google Chrome
-            browser_headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Referer": "https://www.google.com/",
-                "Origin": "https://www.google.com",
-                "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Windows"',
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "cross-site"
-            }
-
-            client = OpenAI(
-                api_key=api_key, 
-                base_url=base_url,
-                default_headers=browser_headers
+            web_context = ""
+            if mode == "Поиск в интернете и ответ":
+                self.set_status("Поиск в интернете…")
+                results = self.web_search(question)
+                if results:
+                    web_context = "\n\nРезультаты веб-поиска (проверяйте источники и даты):\n" + "\n".join(
+                        f"- {r['title'].strip()}\n  {r['url']}\n  {r['snippet'].strip()}" for r in results)
+                else:
+                    web_context = "\nПоиск не вернул результатов."
+            system_prompt = (
+                "Ты — Помощник AI, корпоративный помощник по написанию текстов и анализу документов. "
+                "Отвечай на русском языке, структурированно и по делу. Не выдумывай факты. "
+                "Если опираешься на документы, указывай названия документов. "
+                "Если данных недостаточно, прямо сообщи об этом."
             )
-
-            system_prompt = "Ты — корпоративный помощник по работе с документами. Отвечай кратко и строго по делу на русском языке."
+            if mode == "Написать текст":
+                system_prompt += " Помоги подготовить качественный текст по цели, аудитории и формату пользователя."
+            elif mode == "Проанализировать документы":
+                system_prompt += " Проанализируй загруженные документы: выдели основные положения, противоречия, риски, выводы и практические рекомендации. Не приписывай документам отсутствующие сведения."
             if self.document_text:
-                system_prompt += f"\n\nКонтекст документа:\n{self.document_text[:40000]}"
-
+                system_prompt += "\n\nТЕКСТ ЗАГРУЖЕННЫХ ДОКУМЕНТОВ:\n" + self.document_text[:MAX_CONTEXT_CHARS]
+                if len(self.document_text) > MAX_CONTEXT_CHARS:
+                    system_prompt += "\n[ВНИМАНИЕ: контекст сокращён до лимита; не весь текст передан модели.]"
+            if web_context:
+                system_prompt += "\n\n" + web_context
+            self.set_status("Запрос к ИИ…")
+            client = OpenAI(api_key=api_key, base_url=settings["url"], timeout=60, max_retries=1)
             response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": question}
-                ],
+                model=settings["model"],
+                messages=[{"role": "system", "content": system_prompt},
+                          {"role": "user", "content": question}],
                 temperature=0.2,
             )
-
-            answer = response.choices[0].message.content
-            self.after(0, self.append_to_chat, f"AI ({provider_name.split()[0]})", answer)
-            
-        except Exception as e:
-            self.after(0, self.append_to_chat, "Ошибка", f"Сбой защищенного соединения:\n{str(e)}")
-            
+            answer = response.choices[0].message.content or "(Пустой ответ)"
+            self.after(0, self.append, f"ИИ · {provider}", answer)
+            self.set_status("Готово")
+        except Exception as exc:
+            self.after(0, self.append, "Ошибка", f"{exc}\n\nПроверьте интернет-соединение, API-ключ, доступность модели и ограничения бесплатного тарифа.")
+            self.set_status("Ошибка запроса")
         finally:
-            self.after(0, lambda: self.send_btn.configure(state="normal", text="➤"))
+            self.after(0, lambda: self.send_btn.configure(state="normal", text="Отправить  ➤"))
+
 
 if __name__ == "__main__":
-    app = AichatStyleAssistant()
+    app = PomoshchnikAI()
     app.mainloop()
