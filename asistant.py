@@ -1,362 +1,401 @@
+# -*- coding: utf-8 -*-
+"""
+Помощник AI — многофункциональный настольный помощник.
+Требования: Python 3.10+, customtkinter, openai, PyPDF2, python-docx.
+Веб-поиск использует стандартную библиотеку urllib, без зависимости requests.
+"""
 import os
 import sys
 import json
 import threading
-import html
-from html.parser import HTMLParser
+import urllib.parse
+import urllib.request
+import urllib.error
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
-import requests
 from openai import OpenAI
 import PyPDF2
 import docx
 
 APP_NAME = "Помощник AI"
 CONFIG_FILE = Path.home() / ".pomoshchnik_ai_config.json"
-MAX_CONTEXT_CHARS = 60000
-ctk.set_appearance_mode("System")
+MAX_CONTEXT_CHARS = 70000
+
+ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
-class SearchParser(HTMLParser):
-    """Extract readable text and links from DuckDuckGo HTML results."""
-    def __init__(self):
-        super().__init__()
-        self.results = []
-        self._in_result = False
-        self._in_snippet = False
-        self._current = {"title": "", "url": "", "snippet": ""}
-        self._capture = None
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        classes = attrs.get("class", "")
-        if tag == "a" and "result__a" in classes:
-            self._current = {"title": "", "url": attrs.get("href", ""), "snippet": ""}
-            self._capture = "title"
-        elif tag in ("a", "div") and ("result__snippet" in classes):
-            self._capture = "snippet"
-
-    def handle_endtag(self, tag):
-        if tag == "a" and self._capture == "title":
-            if self._current.get("title"):
-                self.results.append(self._current.copy())
-            self._capture = None
-        elif tag in ("a", "div") and self._capture == "snippet":
-            self._capture = None
-
-    def handle_data(self, data):
-        if self._capture in ("title", "snippet"):
-            self._current[self._capture] += data.strip() + " "
+PROVIDERS = {
+    "Google Gemini": {
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "model": "gemini-2.5-flash",
+        "help": "Создайте API-ключ в Google AI Studio. Доступность бесплатного тарифа зависит от региона и текущих условий."
+    },
+    "Groq": {
+        "url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+        "help": "Создайте API-ключ в консоли Groq. Модели и лимиты могут меняться."
+    },
+    "OpenRouter (free models)": {
+        "url": "https://openrouter.ai/api/v1",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "help": "Нужен API-ключ OpenRouter. Бесплатные модели и их доступность меняются."
+    },
+}
 
 
-class PomoshchnikAI(ctk.CTk):
+class AssistantApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1120x760")
-        self.minsize(900, 620)
+        self.geometry("1240x790")
+        self.minsize(980, 650)
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
+
         self.document_text = ""
         self.document_names = []
-        self.load_config()
+        self.busy = False
+        self.history = []
+        self._load_config()
+        self._build_ui()
+        self._show_welcome()
 
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
-        self.sidebar = ctk.CTkFrame(self, width=285, corner_radius=0)
-        self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.sidebar.grid_columnconfigure(0, weight=1)
-        self.sidebar.grid_rowconfigure(7, weight=1)
-
-        ctk.CTkLabel(self.sidebar, text="✦ Помощник AI",
-                     font=("Segoe UI", 22, "bold")).grid(
-            row=0, column=0, padx=18, pady=(24, 20), sticky="w")
-        ctk.CTkLabel(self.sidebar, text="Провайдер ИИ",
-                     font=("Segoe UI", 12, "bold")).grid(
-            row=1, column=0, padx=18, sticky="w")
-
-        self.providers = {
-            "Google Gemini (бесплатный тариф)": {
-                "url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-                "model": "gemini-2.0-flash",
-            },
-            "Groq (бесплатный тариф)": {
-                "url": "https://api.groq.com/openai/v1",
-                "model": "llama-3.3-70b-versatile",
-            },
-            "OpenRouter (доступные бесплатные модели)": {
-                "url": "https://openrouter.ai/api/v1",
-                "model": "meta-llama/llama-3.3-70b-instruct:free",
-            },
-        }
-        self.provider_menu = ctk.CTkOptionMenu(
-            self.sidebar, values=list(self.providers), command=self.provider_changed)
-        self.provider_menu.grid(row=2, column=0, padx=18, pady=(6, 14), sticky="ew")
-        if self.saved_provider in self.providers:
-            self.provider_menu.set(self.saved_provider)
-
-        ctk.CTkLabel(self.sidebar, text="API-ключ выбранного сервиса",
-                     font=("Segoe UI", 12, "bold")).grid(
-            row=3, column=0, padx=18, sticky="w")
-        self.api_entry = ctk.CTkEntry(self.sidebar, show="*", placeholder_text="Вставьте API-ключ")
-        self.api_entry.grid(row=4, column=0, padx=18, pady=(6, 10), sticky="ew")
-        if self.saved_api_key:
-            self.api_entry.insert(0, self.saved_api_key)
-
-        self.save_btn = ctk.CTkButton(self.sidebar, text="Сохранить настройки",
-                                      command=self.save_config, fg_color="#475569")
-        self.save_btn.grid(row=5, column=0, padx=18, pady=(0, 16), sticky="ew")
-
-        ctk.CTkLabel(self.sidebar, text="Документы",
-                     font=("Segoe UI", 13, "bold")).grid(
-            row=6, column=0, padx=18, sticky="w")
-        self.doc_status = ctk.CTkLabel(
-            self.sidebar, text="Файлы не выбраны", justify="left",
-            wraplength=240, anchor="w")
-        self.doc_status.grid(row=7, column=0, padx=18, pady=8, sticky="new")
-
-        self.load_docs_btn = ctk.CTkButton(
-            self.sidebar, text="Добавить документы…", command=self.load_documents)
-        self.load_docs_btn.grid(row=8, column=0, padx=18, pady=5, sticky="ew")
-        self.save_txt_btn = ctk.CTkButton(
-            self.sidebar, text="Объединить и сохранить TXT…",
-            command=self.export_txt, fg_color="#0f766e")
-        self.save_txt_btn.grid(row=9, column=0, padx=18, pady=5, sticky="ew")
-        self.save_docx_btn = ctk.CTkButton(
-            self.sidebar, text="Объединить и сохранить DOCX…",
-            command=self.export_docx, fg_color="#0f766e")
-        self.save_docx_btn.grid(row=10, column=0, padx=18, pady=(5, 18), sticky="ew")
-
-        self.main = ctk.CTkFrame(self, corner_radius=0)
-        self.main.grid(row=0, column=1, sticky="nsew")
-        self.main.grid_columnconfigure(0, weight=1)
-        self.main.grid_rowconfigure(1, weight=1)
-        self.top = ctk.CTkFrame(self.main, height=56, corner_radius=0)
-        self.top.grid(row=0, column=0, sticky="ew")
-        ctk.CTkLabel(self.top, text="Написание текстов · Поиск · Анализ документов",
-                     font=("Segoe UI", 15, "bold")).pack(side="left", padx=20, pady=15)
-        self.chat = ctk.CTkTextbox(self.main, wrap="word", font=("Segoe UI", 13))
-        self.chat.grid(row=1, column=0, padx=18, pady=12, sticky="nsew")
-        self.chat.configure(state="disabled")
-
-        self.actions = ctk.CTkFrame(self.main, fg_color="transparent")
-        self.actions.grid(row=2, column=0, padx=18, pady=(0, 6), sticky="ew")
-        self.actions.grid_columnconfigure(0, weight=1)
-        self.mode = ctk.CTkOptionMenu(
-            self.actions, values=[
-                "Обычный ответ", "Написать текст", "Проанализировать документы",
-                "Поиск в интернете и ответ"
-            ], width=245)
-        self.mode.set("Обычный ответ")
-        self.mode.grid(row=0, column=0, sticky="w", pady=(0, 6))
-
-        self.input = ctk.CTkTextbox(self.main, height=95, wrap="word", font=("Segoe UI", 13))
-        self.input.grid(row=3, column=0, padx=18, pady=(0, 10), sticky="ew")
-        self.input.bind("<Control-Return>", lambda event: self.send_message())
-        self.bottom = ctk.CTkFrame(self.main, fg_color="transparent")
-        self.bottom.grid(row=4, column=0, padx=18, pady=(0, 16), sticky="ew")
-        self.status = ctk.CTkLabel(self.bottom, text="Готов к работе", anchor="w")
-        self.status.pack(side="left", fill="x", expand=True)
-        self.send_btn = ctk.CTkButton(self.bottom, text="Отправить  ➤",
-                                      command=self.send_message, width=150)
-        self.send_btn.pack(side="right")
-        self.append("Система", "Добро пожаловать! Выберите режим, введите запрос. Можно загрузить несколько PDF, DOCX и TXT, проанализировать их и объединить в один файл.\n\nДля ИИ нужен API-ключ выбранного провайдера. Бесплатные тарифы имеют лимиты и могут меняться. Не отправляйте в сторонние сервисы конфиденциальные документы без разрешения организации.")
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def load_config(self):
-        self.saved_api_key = ""
-        self.saved_provider = "Google Gemini (бесплатный тариф)"
+    def _load_config(self):
+        self.saved_provider = "Google Gemini"
+        self.saved_key = ""
         try:
             if CONFIG_FILE.exists():
                 data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                self.saved_api_key = data.get("api_key", "")
                 self.saved_provider = data.get("provider", self.saved_provider)
+                self.saved_key = data.get("api_key", "")
         except Exception:
             pass
 
-    def save_config(self, silent=False):
-        data = {"api_key": self.api_entry.get().strip(), "provider": self.provider_menu.get()}
+    def _save_config(self, silent=False):
         try:
-            CONFIG_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            CONFIG_FILE.write_text(json.dumps({
+                "provider": self.provider_menu.get(),
+                "api_key": self.api_entry.get().strip()
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
             if not silent:
-                messagebox.showinfo("Помощник AI", f"Настройки сохранены в профиле пользователя:\n{CONFIG_FILE}")
-        except Exception as exc:
+                self._status("Настройки сохранены")
+                messagebox.showinfo(APP_NAME, "Настройки сохранены в профиле текущего пользователя.")
+        except Exception as e:
             if not silent:
-                messagebox.showerror("Ошибка", f"Не удалось сохранить настройки: {exc}")
+                messagebox.showerror("Ошибка сохранения", str(e))
 
-    def on_close(self):
-        self.save_config(silent=True)
+    def close_app(self):
+        self._save_config(silent=True)
         self.destroy()
 
-    def provider_changed(self, _choice):
-        pass
+    def _build_ui(self):
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-    def append(self, who, text):
+        # Sidebar
+        self.sidebar = ctk.CTkFrame(self, width=270, corner_radius=0, fg_color="#101827")
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_propagate(False)
+        self.sidebar.grid_columnconfigure(0, weight=1)
+        self.sidebar.grid_rowconfigure(12, weight=1)
+
+        ctk.CTkLabel(self.sidebar, text="✦ Помощник AI",
+                     font=("Segoe UI", 23, "bold"), text_color="#67e8f9").grid(
+            row=0, column=0, padx=20, pady=(22, 4), sticky="w")
+        ctk.CTkLabel(self.sidebar, text="ВАШ РАБОЧИЙ AI-ИНСТРУМЕНТ",
+                     font=("Segoe UI", 9, "bold"), text_color="#94a3b8").grid(
+            row=1, column=0, padx=21, pady=(0, 18), sticky="w")
+
+        ctk.CTkLabel(self.sidebar, text="ИНСТРУМЕНТЫ", font=("Segoe UI", 10, "bold"),
+                     text_color="#64748b").grid(row=2, column=0, padx=20, sticky="w")
+        self.tool_buttons = {}
+        tools = [
+            ("✎  Написать текст", "Написать текст"),
+            ("⌕  Поиск в интернете", "Поиск в интернете"),
+            ("▤  Анализ документов", "Анализ документов"),
+            ("⇄  Объединить файлы", "Объединить файлы"),
+            ("✧  Универсальный чат", "Обычный ответ"),
+        ]
+        for i, (label, mode) in enumerate(tools, start=3):
+            b = ctk.CTkButton(self.sidebar, text=label, anchor="w", height=39,
+                              corner_radius=8, fg_color="#1e293b", hover_color="#334155",
+                              command=lambda m=mode: self.select_tool(m))
+            b.grid(row=i, column=0, padx=14, pady=4, sticky="ew")
+            self.tool_buttons[mode] = b
+
+        ctk.CTkFrame(self.sidebar, height=1, fg_color="#334155").grid(
+            row=8, column=0, padx=18, pady=14, sticky="ew")
+        ctk.CTkLabel(self.sidebar, text="МОДЕЛЬ ИИ", font=("Segoe UI", 10, "bold"),
+                     text_color="#64748b").grid(row=9, column=0, padx=20, sticky="w")
+        self.provider_menu = ctk.CTkOptionMenu(
+            self.sidebar, values=list(PROVIDERS.keys()), command=self.provider_changed,
+            fg_color="#263449", button_color="#0e7490", button_hover_color="#155e75")
+        self.provider_menu.grid(row=10, column=0, padx=18, pady=(7, 8), sticky="ew")
+        if self.saved_provider in PROVIDERS:
+            self.provider_menu.set(self.saved_provider)
+        self.api_entry = ctk.CTkEntry(self.sidebar, show="*", placeholder_text="API-ключ")
+        self.api_entry.grid(row=11, column=0, padx=18, pady=(0, 8), sticky="ew")
+        if self.saved_key:
+            self.api_entry.insert(0, self.saved_key)
+        ctk.CTkButton(self.sidebar, text="Сохранить настройки", command=self._save_config,
+                      fg_color="#334155", hover_color="#475569").grid(
+            row=12, column=0, padx=18, pady=(2, 8), sticky="new")
+        self.key_help = ctk.CTkLabel(self.sidebar, text="", wraplength=225, justify="left",
+                                     font=("Segoe UI", 10), text_color="#94a3b8")
+        self.key_help.grid(row=13, column=0, padx=18, pady=(0, 18), sticky="sew")
+        self.provider_changed(self.provider_menu.get())
+
+        # Main panel
+        self.main = ctk.CTkFrame(self, corner_radius=0, fg_color="#0b1220")
+        self.main.grid(row=0, column=1, sticky="nsew")
+        self.main.grid_columnconfigure(0, weight=1)
+        self.main.grid_rowconfigure(1, weight=1)
+
+        self.header = ctk.CTkFrame(self.main, height=66, corner_radius=0, fg_color="#111c2e")
+        self.header.grid(row=0, column=0, sticky="ew")
+        self.header.grid_columnconfigure(0, weight=1)
+        self.page_title = ctk.CTkLabel(self.header, text="Универсальный чат",
+                                       font=("Segoe UI", 18, "bold"))
+        self.page_title.grid(row=0, column=0, padx=24, pady=(12, 0), sticky="w")
+        self.page_subtitle = ctk.CTkLabel(self.header, text="Тексты, документы и поиск в одном окне",
+                                          font=("Segoe UI", 11), text_color="#94a3b8")
+        self.page_subtitle.grid(row=1, column=0, padx=24, pady=(0, 10), sticky="w")
+        ctk.CTkButton(self.header, text="＋ Добавить файлы", width=130,
+                      command=self.add_documents).grid(row=0, column=1, rowspan=2, padx=20)
+
+        self.chat = ctk.CTkTextbox(self.main, wrap="word", font=("Segoe UI", 13),
+                                   fg_color="#0b1220", border_width=0)
+        self.chat.grid(row=1, column=0, padx=22, pady=(15, 8), sticky="nsew")
+        self.chat.configure(state="disabled")
+
+        self.docs_bar = ctk.CTkFrame(self.main, fg_color="#111c2e", corner_radius=9)
+        self.docs_bar.grid(row=2, column=0, padx=22, pady=(0, 8), sticky="ew")
+        self.docs_label = ctk.CTkLabel(self.docs_bar, text="Документы не загружены",
+                                       anchor="w", text_color="#94a3b8")
+        self.docs_label.pack(side="left", padx=12, pady=7, fill="x", expand=True)
+        ctk.CTkButton(self.docs_bar, text="Сохранить объединённый DOCX",
+                      width=210, command=self.export_docx, fg_color="#0f766e").pack(
+            side="right", padx=8, pady=5)
+        ctk.CTkButton(self.docs_bar, text="Сохранить TXT", width=125,
+                      command=self.export_txt, fg_color="#0f766e").pack(side="right", padx=4, pady=5)
+
+        self.mode_menu = ctk.CTkOptionMenu(
+            self.main, values=[x[1] for x in tools], command=self.select_tool, width=210,
+            fg_color="#263449", button_color="#0e7490", button_hover_color="#155e75")
+        self.mode_menu.set("Обычный ответ")
+        self.mode_menu.grid(row=3, column=0, padx=22, pady=(4, 7), sticky="w")
+
+        self.input = ctk.CTkTextbox(self.main, height=95, wrap="word", font=("Segoe UI", 13),
+                                    fg_color="#111c2e", border_color="#334155", border_width=1)
+        self.input.grid(row=4, column=0, padx=22, pady=(0, 9), sticky="ew")
+        self.input.bind("<Control-Return>", lambda e: self.send())
+        self.footer = ctk.CTkFrame(self.main, fg_color="transparent")
+        self.footer.grid(row=5, column=0, padx=22, pady=(0, 15), sticky="ew")
+        self.status_label = ctk.CTkLabel(self.footer, text="Готов к работе",
+                                         text_color="#94a3b8", anchor="w")
+        self.status_label.pack(side="left", fill="x", expand=True)
+        self.send_btn = ctk.CTkButton(self.footer, text="Отправить  ➤", width=145,
+                                      height=39, command=self.send, corner_radius=9)
+        self.send_btn.pack(side="right")
+
+    def provider_changed(self, provider):
+        info = PROVIDERS.get(provider, {})
+        self.key_help.configure(text=info.get("help", ""))
+
+    def select_tool(self, mode):
+        self.mode_menu.set(mode)
+        titles = {
+            "Написать текст": ("Написать текст", "Укажите тип текста, цель, аудиторию и желаемый стиль"),
+            "Поиск в интернете": ("Поиск в интернете", "Найду результаты, затем попрошу ИИ составить ответ"),
+            "Анализ документов": ("Анализ документов", "Сначала добавьте документы кнопкой в верхней панели"),
+            "Объединить файлы": ("Объединить файлы", "Добавьте несколько файлов и сохраните общий TXT или DOCX"),
+            "Обычный ответ": ("Универсальный чат", "Задайте вопрос или поручите задачу помощнику"),
+        }
+        title, subtitle = titles.get(mode, (mode, ""))
+        self.page_title.configure(text=title)
+        self.page_subtitle.configure(text=subtitle)
+        for key, button in self.tool_buttons.items():
+            button.configure(fg_color="#0e7490" if key == mode else "#1e293b")
+
+    def _show_welcome(self):
+        self._append("Помощник AI", "Здравствуйте! Я помогу написать текст, найти информацию в интернете, проанализировать документы и объединить несколько файлов.\n\n1. Выберите инструмент слева.\n2. При необходимости добавьте PDF, DOCX или TXT.\n3. Введите API-ключ выбранного провайдера и отправьте запрос.\n\nУ бесплатных API есть ограничения, а доступность моделей может меняться. Не отправляйте конфиденциальные документы во внешние сервисы без разрешения вашей организации.")
+
+    def _append(self, who, text):
         self.chat.configure(state="normal")
-        self.chat.insert("end", f"\n{'─' * 44}\n{who}\n{'─' * 44}\n{text}\n")
+        self.chat.insert("end", f"\n{who}\n{'─' * 48}\n{text}\n\n")
         self.chat.configure(state="disabled")
         self.chat.see("end")
 
-    def set_status(self, text):
-        self.after(0, lambda: self.status.configure(text=text))
+    def _status(self, text):
+        self.after(0, lambda: self.status_label.configure(text=text))
 
-    def read_file(self, path):
+    def _read_file(self, path):
         ext = path.suffix.lower()
         if ext == ".pdf":
-            parts = []
             with path.open("rb") as f:
                 reader = PyPDF2.PdfReader(f)
-                for page in reader.pages:
-                    parts.append(page.extract_text() or "")
-            return "\n".join(parts)
+                return "\n".join(page.extract_text() or "" for page in reader.pages)
         if ext == ".docx":
-            d = docx.Document(str(path))
-            parts = [p.text for p in d.paragraphs]
-            for table in d.tables:
+            document = docx.Document(str(path))
+            chunks = [p.text for p in document.paragraphs]
+            for table in document.tables:
                 for row in table.rows:
-                    parts.append(" | ".join(cell.text for cell in row.cells))
-            return "\n".join(parts)
+                    chunks.append(" | ".join(cell.text for cell in row.cells))
+            return "\n".join(chunks)
         if ext == ".txt":
             return path.read_text(encoding="utf-8-sig")
-        raise ValueError(f"Формат {ext} не поддерживается")
+        raise ValueError("Поддерживаются только PDF, DOCX и TXT.")
 
-    def load_documents(self):
-        names = filedialog.askopenfilenames(
-            title="Выберите один или несколько документов",
-            filetypes=[("Документы PDF, Word, TXT", "*.pdf *.docx *.txt"),
-                       ("Все файлы", "*.*")])
-        if not names:
+    def add_documents(self):
+        paths = filedialog.askopenfilenames(
+            title="Добавить документы",
+            filetypes=[("Документы", "*.pdf *.docx *.txt"), ("Все файлы", "*.*")])
+        if not paths:
             return
-        pieces, loaded, errors = [], [], []
-        for name in names:
-            path = Path(name)
+        names, chunks, errors = [], [], []
+        for raw in paths:
+            path = Path(raw)
             try:
-                text = self.read_file(path).strip()
-                if not text:
-                    errors.append(f"{path.name}: текст не извлечён (возможно, PDF состоит из сканов)")
+                content = self._read_file(path).strip()
+                if not content:
+                    errors.append(f"{path.name}: текст не извлечён (PDF может быть сканом).")
                     continue
-                pieces.append(f"\n\n===== ДОКУМЕНТ: {path.name} =====\n{text}")
-                loaded.append(path.name)
+                names.append(path.name)
+                chunks.append(f"===== ДОКУМЕНТ: {path.name} =====\n{content}")
             except Exception as exc:
                 errors.append(f"{path.name}: {exc}")
-        if pieces:
-            self.document_text = "\n".join(pieces)
-            self.document_names = loaded
-            shown = "\n".join("• " + n for n in loaded)
-            if len(shown) > 850:
-                shown = shown[:850] + "…"
-            self.doc_status.configure(text=f"Загружено: {len(loaded)}\n{shown}")
-            self.append("Система", f"Загружено документов: {len(loaded)}. Их текст доступен для анализа и объединения.")
+        if chunks:
+            self.document_names = names
+            self.document_text = "\n\n".join(chunks)
+            self.docs_label.configure(text=f"Загружено документов: {len(names)} · " + ", ".join(names)[:180])
+            self._append("Система", f"Загружено документов: {len(names)}.\n" + "\n".join(names))
+            self.select_tool("Анализ документов")
         if errors:
-            messagebox.showwarning("Некоторые файлы пропущены", "\n".join(errors[:10]))
+            messagebox.showwarning("Не все файлы обработаны", "\n".join(errors[:8]))
 
     def export_txt(self):
         if not self.document_text:
-            messagebox.showwarning("Нет документов", "Сначала загрузите документы.")
+            messagebox.showinfo(APP_NAME, "Сначала добавьте документы.")
             return
         path = filedialog.asksaveasfilename(defaultextension=".txt",
-                    filetypes=[("Текстовый файл", "*.txt")], initialfile="объединённые_документы.txt")
+            initialfile="объединённые_документы.txt", filetypes=[("Текстовый файл", "*.txt")])
         if path:
             Path(path).write_text(self.document_text, encoding="utf-8")
-            messagebox.showinfo("Готово", f"Файл сохранён:\n{path}")
+            self._status("TXT-файл сохранён")
 
     def export_docx(self):
         if not self.document_text:
-            messagebox.showwarning("Нет документов", "Сначала загрузите документы.")
+            messagebox.showinfo(APP_NAME, "Сначала добавьте документы.")
             return
         path = filedialog.asksaveasfilename(defaultextension=".docx",
-                    filetypes=[("Документ Word", "*.docx")], initialfile="объединённые_документы.docx")
+            initialfile="объединённые_документы.docx", filetypes=[("Word", "*.docx")])
         if path:
             out = docx.Document()
             out.add_heading("Объединённые документы", 0)
-            for chunk in self.document_text.split("\n\n===== ДОКУМЕНТ: "):
-                if not chunk.strip():
-                    continue
-                lines = chunk.splitlines()
-                title = lines[0].replace("=====", "").strip() if lines else "Документ"
-                out.add_heading(title, level=1)
-                body = "\n".join(lines[1:]) if len(lines) > 1 else chunk
-                for para in body.splitlines():
-                    if para.strip():
-                        out.add_paragraph(para)
+            for i, name in enumerate(self.document_names):
+                out.add_heading(name, level=1)
+                marker = f"===== ДОКУМЕНТ: {name} =====\n"
+                content = self.document_text.split(marker, 1)[1] if marker in self.document_text else ""
+                # Keep only the portion belonging to this file.
+                next_marker = "\n\n===== ДОКУМЕНТ: "
+                content = content.split(next_marker, 1)[0]
+                for paragraph in content.splitlines():
+                    if paragraph.strip():
+                        out.add_paragraph(paragraph)
             out.save(path)
-            messagebox.showinfo("Готово", f"Файл сохранён:\n{path}")
+            self._status("DOCX-файл сохранён")
 
-    def web_search(self, query):
-        # Ordinary HTTPS search request; no spoofed browser headers or traffic concealment.
-        response = requests.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query}, timeout=20,
-            headers={"User-Agent": "PomoshchnikAI/1.0 (web search)"})
-        response.raise_for_status()
-        parser = SearchParser()
-        parser.feed(response.text)
-        return parser.results[:7]
-
-    def send_message(self):
-        question = self.input.get("1.0", "end").strip()
-        if not question:
+    def send(self):
+        if self.busy:
+            return
+        prompt = self.input.get("1.0", "end").strip()
+        mode = self.mode_menu.get()
+        if mode == "Объединить файлы":
+            self.export_docx()
+            return
+        if mode == "Анализ документов" and not self.document_text:
+            messagebox.showwarning(APP_NAME, "Сначала добавьте документы.")
+            return
+        if not prompt and mode == "Анализ документов":
+            prompt = "Подробно проанализируй загруженные документы: краткое содержание, ключевые положения, противоречия, риски, выводы и практические рекомендации. Указывай названия источников."
+        if not prompt:
             return
         api_key = self.api_entry.get().strip()
         if not api_key:
-            messagebox.showwarning("Нужен API-ключ", "Введите API-ключ выбранного провайдера. Ключ выдаётся на сайте провайдера; бесплатный доступ зависит от его актуальных условий.")
+            messagebox.showwarning("Нужен API-ключ", "Введите API-ключ выбранного провайдера. Бесплатный доступ зависит от условий сервиса.")
             return
-        self.input.delete("1.0", "end")
-        self.append("Вы", question)
-        self.send_btn.configure(state="disabled", text="Обработка…")
-        self.set_status("Выполняется запрос…")
         provider = self.provider_menu.get()
-        settings = self.providers[provider]
-        mode = self.mode.get()
-        threading.Thread(target=self.worker, args=(question, api_key, provider, settings, mode), daemon=True).start()
+        config = PROVIDERS[provider]
+        self.input.delete("1.0", "end")
+        self._append("Вы", prompt)
+        self.busy = True
+        self.send_btn.configure(state="disabled", text="Работаю…")
+        self._status("Выполняется запрос…")
+        threading.Thread(target=self._worker, args=(prompt, mode, api_key, provider, config), daemon=True).start()
 
-    def worker(self, question, api_key, provider, settings, mode):
+    def _web_search(self, query):
+        url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            page = response.read().decode("utf-8", errors="replace")
+        # Extract result blocks without adding a third-party HTML parser dependency.
+        import re
+        links = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, re.I | re.S)
+        snippets = re.findall(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>|<div[^>]+class="result__snippet"[^>]*>(.*?)</div>', page, re.I | re.S)
+        clean = lambda s: re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s)).strip()
+        results = []
+        for i, (href, title) in enumerate(links[:7]):
+            snippet = ""
+            if i < len(snippets):
+                snippet = clean(snippets[i][0] or snippets[i][1])
+            results.append(f"- {clean(title)}\n  {href}\n  {snippet}")
+        return "\n".join(results) if results else "Поиск не вернул результатов. Попробуйте изменить запрос."
+
+    def _worker(self, prompt, mode, api_key, provider, config):
         try:
             web_context = ""
-            if mode == "Поиск в интернете и ответ":
-                self.set_status("Поиск в интернете…")
-                results = self.web_search(question)
-                if results:
-                    web_context = "\n\nРезультаты веб-поиска (проверяйте источники и даты):\n" + "\n".join(
-                        f"- {r['title'].strip()}\n  {r['url']}\n  {r['snippet'].strip()}" for r in results)
-                else:
-                    web_context = "\nПоиск не вернул результатов."
-            system_prompt = (
-                "Ты — Помощник AI, корпоративный помощник по написанию текстов и анализу документов. "
-                "Отвечай на русском языке, структурированно и по делу. Не выдумывай факты. "
-                "Если опираешься на документы, указывай названия документов. "
-                "Если данных недостаточно, прямо сообщи об этом."
+            if mode == "Поиск в интернете":
+                self._status("Поиск в интернете…")
+                web_context = "\n\nРЕЗУЛЬТАТЫ ПОИСКА:\n" + self._web_search(prompt)
+            system = (
+                "Ты — Помощник AI, русскоязычный помощник по написанию текстов и работе с документами. "
+                "Пиши понятно, структурированно и профессионально. Не выдумывай источники и факты. "
+                "Отделяй подтверждённую информацию от предположений."
             )
             if mode == "Написать текст":
-                system_prompt += " Помоги подготовить качественный текст по цели, аудитории и формату пользователя."
-            elif mode == "Проанализировать документы":
-                system_prompt += " Проанализируй загруженные документы: выдели основные положения, противоречия, риски, выводы и практические рекомендации. Не приписывай документам отсутствующие сведения."
+                system += " Подготовь готовый текст с учётом цели, аудитории, формата и стиля из запроса."
+            elif mode == "Анализ документов":
+                system += " Проанализируй предоставленные документы, указывай названия файлов, находи выводы и расхождения. Не додумывай отсутствующие данные."
             if self.document_text:
-                system_prompt += "\n\nТЕКСТ ЗАГРУЖЕННЫХ ДОКУМЕНТОВ:\n" + self.document_text[:MAX_CONTEXT_CHARS]
+                system += "\n\nТЕКСТ ДОКУМЕНТОВ:\n" + self.document_text[:MAX_CONTEXT_CHARS]
                 if len(self.document_text) > MAX_CONTEXT_CHARS:
-                    system_prompt += "\n[ВНИМАНИЕ: контекст сокращён до лимита; не весь текст передан модели.]"
+                    system += "\n[Контекст ограничен: не весь текст был передан модели.]"
             if web_context:
-                system_prompt += "\n\n" + web_context
-            self.set_status("Запрос к ИИ…")
-            client = OpenAI(api_key=api_key, base_url=settings["url"], timeout=60, max_retries=1)
+                system += web_context + "\nУкажи, что результаты получены поиском, и не считай сниппеты полной проверкой источников."
+            self._status("Обращение к ИИ…")
+            client = OpenAI(api_key=api_key, base_url=config["url"], timeout=60, max_retries=1)
             response = client.chat.completions.create(
-                model=settings["model"],
-                messages=[{"role": "system", "content": system_prompt},
-                          {"role": "user", "content": question}],
-                temperature=0.2,
-            )
-            answer = response.choices[0].message.content or "(Пустой ответ)"
-            self.after(0, self.append, f"ИИ · {provider}", answer)
-            self.set_status("Готово")
+                model=config["model"],
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": prompt}],
+                temperature=0.3)
+            answer = response.choices[0].message.content or "Модель вернула пустой ответ."
+            self.after(0, self._append, "Помощник AI · " + provider, answer)
+            self._status("Готово")
+        except urllib.error.URLError as exc:
+            self.after(0, self._append, "Ошибка сети", f"Не удалось выполнить сетевой запрос: {exc}")
+            self._status("Ошибка сети")
         except Exception as exc:
-            self.after(0, self.append, "Ошибка", f"{exc}\n\nПроверьте интернет-соединение, API-ключ, доступность модели и ограничения бесплатного тарифа.")
-            self.set_status("Ошибка запроса")
+            self.after(0, self._append, "Ошибка", f"{exc}\n\nПроверьте API-ключ, имя модели, лимиты провайдера и доступ к интернету.")
+            self._status("Ошибка запроса")
         finally:
+            self.busy = False
             self.after(0, lambda: self.send_btn.configure(state="normal", text="Отправить  ➤"))
 
 
 if __name__ == "__main__":
-    app = PomoshchnikAI()
+    app = AssistantApp()
     app.mainloop()
